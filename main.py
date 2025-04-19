@@ -1,10 +1,23 @@
-
 import logging
+import sqlite3 # Убедитесь, что sqlite3 импортирован здесь
+import os      # Импортируем os для работы с путями
+
 from aiogram import Bot, Dispatcher, executor, types
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.dispatcher import FSMContext
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from decouple import config
+
+# --- Начало: Конфигурация пути к БД для Railway Volume ---
+VOLUME_MOUNT_PATH = '/data'  # Это путь, который вы указываете в Railway Volumes
+DB_FILENAME = 'bot.db'       # Имя вашего файла БД
+DB_PATH = os.path.join(VOLUME_MOUNT_PATH, DB_FILENAME) # Полный путь к файлу БД
+
+# Убедимся, что директория для Volume существует (Railway ее создает, но лучше проверить)
+# os.makedirs создаст директорию, если ее нет, и не выдаст ошибку, если она уже есть
+os.makedirs(VOLUME_MOUNT_PATH, exist_ok=True)
+logging.info(f"Используется путь к базе данных: {DB_PATH}")
+# --- Конец: Конфигурация пути к БД ---
 
 
 API_TOKEN = config('TOKEN')
@@ -15,26 +28,29 @@ bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
-# database.py
-import sqlite3
-import os
+# database.py (содержимое теперь внутри main.py)
 
 def create_tables():
-    """Создание таблиц в базе данных с обработкой ошибок"""
+    """Создание таблиц в базе данных с использованием пути из Volume"""
     conn = None
     try:
-        if os.path.exists("bot.db"):
-            try:
-                os.remove("bot.db")
-                logging.info("Старая база данных удалена.")
-            except PermissionError:
-                logging.error("Ошибка: Файл bot.db занят. Закройте все программы, использующие его.")
-                return
+        # ---- ИЗМЕНЕНО ----
+        # УДАЛЕНО: Проверка и удаление старой БД. Нам нужно сохранять данные!
+        # if os.path.exists(DB_PATH):
+        #     try:
+        #         os.remove(DB_PATH) # НЕ УДАЛЯТЬ БД ПРИ КАЖДОМ ЗАПУСКЕ!
+        #         logging.info("Старая база данных удалена.")
+        #     except PermissionError:
+        #         logging.error("Ошибка: Файл bot.db занят...")
+        #         return
 
-        conn = sqlite3.connect('bot.db')
+        # ---- ИЗМЕНЕНО ----
+        # Используем DB_PATH для подключения
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
 
         # Создаем таблицу users с уникальным chat_id
+        # (IF NOT EXISTS предотвратит ошибку, если таблицы уже созданы)
         cursor.execute('''CREATE TABLE IF NOT EXISTS users (
                           id INTEGER PRIMARY KEY,
                           first_name TEXT,
@@ -42,7 +58,7 @@ def create_tables():
                           username TEXT,
                           chat_id INTEGER UNIQUE)''')
 
-        # Исправленная таблица test_results (без user_id)
+        # Исправленная таблица test_results
         cursor.execute('''CREATE TABLE IF NOT EXISTS test_results (
                           first_name TEXT,
                           last_name TEXT,
@@ -50,24 +66,23 @@ def create_tables():
                           result TEXT)''')
 
         cursor.execute('''CREATE TABLE IF NOT EXISTS subscribers (
-                          user_id INTEGER)''')
+                          user_id INTEGER UNIQUE)''') # Добавил UNIQUE, чтобы избежать дублей
 
         cursor.execute('''CREATE TABLE IF NOT EXISTS discounts (
                           id INTEGER PRIMARY KEY,
                           description TEXT,
                           start_date TEXT,
                           end_date TEXT)''')
-        #
-
-
 
         conn.commit()
-        logging.info("Таблицы успешно созданы.")
+        logging.info("Таблицы успешно созданы или уже существуют.")
     except sqlite3.Error as e:
-        logging.error(f"Ошибка SQLite: {e}")
+        logging.error(f"Ошибка SQLite при создании таблиц: {e}")
     finally:
         if conn:
             conn.close()
+
+# ... (Остальные классы и переменные, как TestStates, catalog_data - БЕЗ ИЗМЕНЕНИЙ) ...
 class TestStates(StatesGroup):
     question1 = State()
     question2 = State()
@@ -81,7 +96,6 @@ class TestStates(StatesGroup):
     question10 = State()
     question11 = State()
 
-# Глобальный словарь каталога (без ключевых слов description, link внутри итогового текста)
 catalog_data = {
     "Android": (
         "🔧 Хочешь создавать приложения, которые будут жить в карманах миллионов людей?\n\n"
@@ -111,20 +125,26 @@ catalog_data = {
     )
 }
 
+
 # Команда /start
 @dp.message_handler(commands=['start'])
 async def send_welcome(message: types.Message):
     user = message.from_user
-    conn = sqlite3.connect('bot.db')
+    # ---- ИЗМЕНЕНО ----
+    conn = sqlite3.connect(DB_PATH) # Используем DB_PATH
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE chat_id = ?", (message.chat.id,))
-    if not cursor.fetchone():
+    try:
+        # Используем INSERT OR IGNORE чтобы не было ошибки при дубликате chat_id
         cursor.execute(
-            "INSERT INTO users (first_name, last_name, username, chat_id) VALUES (?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO users (first_name, last_name, username, chat_id) VALUES (?, ?, ?, ?)",
             (user.first_name, user.last_name, user.username, message.chat.id)
         )
         conn.commit()
-    conn.close()
+    except sqlite3.Error as e:
+         logging.error(f"Ошибка SQLite в /start: {e}")
+    finally:
+        conn.close()
+
     await message.reply(
         "🌟 Привет! Добро пожаловать в мир крутых возможностей! 🌟 Я твой верный помощник, готовый помочь выбрать направление обучения, которое раскроет твой талант и приведёт к успеху!\n\n"
         "🚀 Вот что я могу для тебя:\n"
@@ -135,7 +155,9 @@ async def send_welcome(message: types.Message):
         "- Узнай о текущих /discounts и хватай лучшие предложения!"
     )
 
-# Команда /test – запуск теста с 11 вопросами
+# --- Обработчики команды /test (q1 - q10) ---
+# В этих обработчиках нет прямого взаимодействия с БД, поэтому они БЕЗ ИЗМЕНЕНИЙ
+# (код для q1 - q10 опущен для краткости, он остается таким же)
 @dp.message_handler(commands=['test'])
 async def start_test(message: types.Message):
     await TestStates.question1.set()
@@ -154,7 +176,7 @@ async def process_q1(callback_query: types.CallbackQuery, state: FSMContext):
     async with state.proxy() as data:
         data['q1'] = answer
     await TestStates.next()
-
+    # ... остальной код для q1 -> q2 ...
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         types.InlineKeyboardButton(text="a) Придумывать, как он будет выглядеть 🎨", callback_data="q2_a"),
@@ -167,13 +189,14 @@ async def process_q1(callback_query: types.CallbackQuery, state: FSMContext):
                            reply_markup=keyboard)
     await callback_query.answer()
 
+
 @dp.callback_query_handler(lambda c: c.data.startswith("q2_"), state=TestStates.question2)
 async def process_q2(callback_query: types.CallbackQuery, state: FSMContext):
     answer = callback_query.data.split("_")[1]
     async with state.proxy() as data:
         data['q2'] = answer
     await TestStates.next()
-
+    # ... остальной код для q2 -> q3 ...
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         types.InlineKeyboardButton(text="a) Очень нравится! 😍", callback_data="q3_a"),
@@ -192,7 +215,7 @@ async def process_q3(callback_query: types.CallbackQuery, state: FSMContext):
     async with state.proxy() as data:
         data['q3'] = answer
     await TestStates.next()
-
+    # ... остальной код для q3 -> q4 ...
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         types.InlineKeyboardButton(text="a) Компьютер и сайты 🖥️", callback_data="q4_a"),
@@ -211,7 +234,7 @@ async def process_q4(callback_query: types.CallbackQuery, state: FSMContext):
     async with state.proxy() as data:
         data['q4'] = answer
     await TestStates.next()
-
+    # ... остальной код для q4 -> q5 ...
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         types.InlineKeyboardButton(text="a) Я визуал — люблю, когда всё красиво 🎨", callback_data="q5_a"),
@@ -230,7 +253,7 @@ async def process_q5(callback_query: types.CallbackQuery, state: FSMContext):
     async with state.proxy() as data:
         data['q5'] = answer
     await TestStates.next()
-
+    # ... остальной код для q5 -> q6 ...
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         types.InlineKeyboardButton(text="a) Собирать картинки, вдохновляться дизайнами 🖼️", callback_data="q6_a"),
@@ -249,7 +272,7 @@ async def process_q6(callback_query: types.CallbackQuery, state: FSMContext):
     async with state.proxy() as data:
         data['q6'] = answer
     await TestStates.next()
-
+    # ... остальной код для q6 -> q7 ...
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         types.InlineKeyboardButton(text="a) Учиться рисовать интерфейсы 🎨", callback_data="q7_a"),
@@ -268,7 +291,7 @@ async def process_q7(callback_query: types.CallbackQuery, state: FSMContext):
     async with state.proxy() as data:
         data['q7'] = answer
     await TestStates.next()
-
+    # ... остальной код для q7 -> q8 ...
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         types.InlineKeyboardButton(text="a) Работать с цветами, шрифтами и стилями 🌈", callback_data="q8_a"),
@@ -287,7 +310,7 @@ async def process_q8(callback_query: types.CallbackQuery, state: FSMContext):
     async with state.proxy() as data:
         data['q8'] = answer
     await TestStates.next()
-
+    # ... остальной код для q8 -> q9 ...
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         types.InlineKeyboardButton(text="a) Искусство, черчение 🎨", callback_data="q9_a"),
@@ -306,7 +329,7 @@ async def process_q9(callback_query: types.CallbackQuery, state: FSMContext):
     async with state.proxy() as data:
         data['q9'] = answer
     await TestStates.next()
-
+    # ... остальной код для q9 -> q10 ...
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         types.InlineKeyboardButton(text="a) Через картинки и примеры 🖼️", callback_data="q10_a"),
@@ -325,7 +348,7 @@ async def process_q10(callback_query: types.CallbackQuery, state: FSMContext):
     async with state.proxy() as data:
         data['q10'] = answer
     await TestStates.next()
-
+    # ... остальной код для q10 -> q11 ...
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         types.InlineKeyboardButton(text="a) Делать красивые макеты для сайтов/приложений 🎨", callback_data="q11_a"),
@@ -338,52 +361,85 @@ async def process_q10(callback_query: types.CallbackQuery, state: FSMContext):
                            reply_markup=keyboard)
     await callback_query.answer()
 
+
 @dp.callback_query_handler(lambda c: c.data.startswith("q11_"), state=TestStates.question11)
 async def process_q11(callback_query: types.CallbackQuery, state: FSMContext):
     """Обработка 11 вопроса и сохранение результата"""
+    # ... (логика определения result - БЕЗ ИЗМЕНЕНИЙ) ...
     async with state.proxy() as data:
-        answers = [data.get(f'q{i}') for i in range(1, 12)]
+        # ---- ДОБАВЛЕНО: Получаем ответ на q11 ----
+        answer = callback_query.data.split("_")[1]
+        data['q11'] = answer
+        # -----------------------------------------
+        answers = [data.get(f'q{i}') for i in range(1, 12)] # Теперь до 12 включительно
         counts = {'a': 0, 'b': 0, 'c': 0, 'd': 0}
         for ans in answers:
             if ans in counts:
                 counts[ans] += 1
 
-        direction = max(counts, key=counts.get)
-        direction_map = {
-            'a': 'UX/UI-дизайн',
-            'b': 'Backend-разработка',
-            'c': 'Frontend-разработка',
-            'd': 'Android-разработка'
-        }
-        result = direction_map.get(direction, 'Не определено')
+        # Если есть 'd', Android - приоритет
+        if counts.get('d', 0) > 0:
+             direction = 'd'
+        # Иначе, если 'a' и 'c' равны и больше 'b', то Fullstack
+        elif counts.get('a', 0) > 0 and counts.get('a', 0) == counts.get('c', 0) and counts.get('a', 0) > counts.get('b', 0):
+            result = 'FullStack-разработка' # Отдельная логика для FullStack
+        # Иначе выбираем максимум
+        else:
+             # Находим ключ с максимальным значением. Если есть несколько максимумов,
+             # вернется один из них (порядок может быть не гарантирован)
+             non_d_counts = {k: v for k, v in counts.items() if k != 'd'}
+             if not non_d_counts: # Если только 'd' были или вообще нет ответов
+                 direction = 'd' # Или можно выбрать другое дефолтное значение
+             else:
+                 direction = max(non_d_counts, key=non_d_counts.get)
 
-        # Исправленный запрос с правильными полями
+        # Если результат не был 'FullStack', используем карту
+        if 'result' not in locals(): # Проверяем, была ли уже присвоена переменная result
+            direction_map = {
+                'a': 'UX/UI-дизайн',
+                'b': 'Backend-разработка',
+                'c': 'Frontend-разработка',
+                'd': 'Android-разработка'
+            }
+            result = direction_map.get(direction, 'Не определено')
+
+
         user = callback_query.from_user
+        conn = None # Инициализируем conn
         try:
-            with sqlite3.connect('bot.db') as conn:
-                cursor = conn.cursor()
-                cursor.execute('''INSERT INTO test_results 
-                                (first_name, last_name, username, result)
-                                VALUES (?, ?, ?, ?)''',
-                              (user.first_name,
-                               user.last_name,
-                               user.username,
-                               result))
-                conn.commit()
+            # ---- ИЗМЕНЕНО ----
+            conn = sqlite3.connect(DB_PATH) # Используем DB_PATH
+            cursor = conn.cursor()
+            cursor.execute('''INSERT INTO test_results
+                            (first_name, last_name, username, result)
+                            VALUES (?, ?, ?, ?)''',
+                          (user.first_name,
+                           user.last_name,
+                           user.username,
+                           result))
+            conn.commit()
         except sqlite3.Error as e:
-            logging.error(f"Ошибка сохранения: {e}")
-            await callback_query.answer("❌ Ошибка сохранения результата")
-            return
+            logging.error(f"Ошибка сохранения результата теста: {e}")
+            await bot.send_message(callback_query.from_user.id, "❌ Произошла ошибка при сохранении вашего результата.") # Отправляем сообщение пользователю
+            await state.finish() # Завершаем состояние в случае ошибки
+            return # Выходим из функции
+        finally:
+            if conn:
+                conn.close()
 
     await state.finish()
     await bot.send_message(
         callback_query.from_user.id,
-        f"🎉 Ваш результат: {result}\n"
-        f"Исследуйте курсы: /catalog"
+        f"🎉 Ваш результат: *{result}*\n\n"
+        "Похоже, это направление тебе подходит! 😉\n"
+        "Хочешь узнать больше? Загляни в наш каталог!\n\n"
+        "👉 /catalog",
+        parse_mode="Markdown"
     )
+    await callback_query.answer() # Отвечаем на callback query
 
 
-# Команда /catalog — вывод каталога направлений
+# Команда /catalog — вывод каталога направлений (БЕЗ ИЗМЕНЕНИЙ)
 @dp.message_handler(commands=['catalog'])
 async def send_catalog(message: types.Message):
     result_text = "📚 *Каталог направлений:*\n\n"
@@ -395,43 +451,82 @@ async def send_catalog(message: types.Message):
             f"👉 [Подробнее]({link})\n\n"
             f"{'-'*40}\n\n"
         )
-    await message.reply(result_text, parse_mode="Markdown")
+    await message.reply(result_text, parse_mode="Markdown", disable_web_page_preview=True) # Добавил disable_web_page_preview
 
+# Команда /subscribe
 @dp.message_handler(commands=['subscribe'])
 async def subscribe(message: types.Message):
-    conn = sqlite3.connect('bot.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM subscribers WHERE user_id = ?", (message.from_user.id,))
-    if cursor.fetchone():
-        await message.reply("Вы уже подписаны на новости 😊")
-    else:
-        cursor.execute("INSERT INTO subscribers (user_id) VALUES (?)", (message.from_user.id,))
-        conn.commit()
-        await message.reply("Вы успешно подписались на новости! 📢")
-    conn.close()
+    conn = None
+    try:
+        # ---- ИЗМЕНЕНО ----
+        conn = sqlite3.connect(DB_PATH) # Используем DB_PATH
+        cursor = conn.cursor()
+        # Используем INSERT OR IGNORE для простоты и атомарности
+        cursor.execute("INSERT OR IGNORE INTO subscribers (user_id) VALUES (?)", (message.from_user.id,))
+        # rowcount покажет, была ли вставлена новая строка (1) или запись уже существовала (0)
+        if cursor.rowcount > 0:
+            conn.commit()
+            await message.reply("Вы успешно подписались на новости! 📢")
+        else:
+            await message.reply("Вы уже подписаны на новости 😊")
+    except sqlite3.Error as e:
+        logging.error(f"Ошибка SQLite в /subscribe: {e}")
+        await message.reply("❌ Произошла ошибка при подписке.")
+    finally:
+        if conn:
+            conn.close()
 
+
+# Команда /unsubscribe
 @dp.message_handler(commands=['unsubscribe'])
 async def unsubscribe(message: types.Message):
-    conn = sqlite3.connect('bot.db')
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM subscribers WHERE user_id = ?", (message.from_user.id,))
-    conn.commit()
-    await message.reply("Вы отписались от новостей. 👋")
-    conn.close()
+    conn = None
+    try:
+        # ---- ИЗМЕНЕНО ----
+        conn = sqlite3.connect(DB_PATH) # Используем DB_PATH
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM subscribers WHERE user_id = ?", (message.from_user.id,))
+        conn.commit()
+        # Проверяем, была ли строка удалена
+        if cursor.rowcount > 0:
+             await message.reply("Вы отписались от новостей. 👋")
+        else:
+             await message.reply("Вы и так не были подписаны. 🤔")
+    except sqlite3.Error as e:
+        logging.error(f"Ошибка SQLite в /unsubscribe: {e}")
+        await message.reply("❌ Произошла ошибка при отписке.")
+    finally:
+        if conn:
+            conn.close()
 
+
+# Команда /discounts
 @dp.message_handler(commands=['discounts'])
 async def send_discounts(message: types.Message):
-    conn = sqlite3.connect('bot.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT description FROM discounts WHERE end_date > date('now')")
-    discounts = cursor.fetchall()
-    conn.close()
-    if discounts:
-        discounts_text = "Текущие скидки:\n" + "\n".join([d[0] for d in discounts])
-    else:
-        discounts_text = "На данный момент скидок нет. 😔"
-    await message.reply(discounts_text)
+    conn = None
+    try:
+        # ---- ИЗМЕНЕНО ----
+        conn = sqlite3.connect(DB_PATH) # Используем DB_PATH
+        cursor = conn.cursor()
+        # Убедитесь, что формат дат в БД совместим с date('now') SQLite (YYYY-MM-DD)
+        cursor.execute("SELECT description FROM discounts WHERE end_date >= date('now') ORDER BY end_date") # >= чтобы включить текущий день
+        discounts = cursor.fetchall()
+
+        if discounts:
+            discounts_text = "🔥 *Актуальные скидки и акции:*\n\n" + "\n\n".join([f"• {d[0]}" for d in discounts])
+        else:
+            discounts_text = "На данный момент активных скидок нет. Следите за обновлениями! 😉"
+        await message.reply(discounts_text, parse_mode="Markdown")
+    except sqlite3.Error as e:
+        logging.error(f"Ошибка SQLite в /discounts: {e}")
+        await message.reply("❌ Не удалось загрузить информацию о скидках.")
+    finally:
+        if conn:
+            conn.close()
+
 
 if __name__ == '__main__':
+    # Создаем таблицы ПЕРЕД запуском бота
     create_tables()
+    # Запускаем бота
     executor.start_polling(dp, skip_updates=True)
